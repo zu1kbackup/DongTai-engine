@@ -38,6 +38,15 @@ from lingzhi_engine import settings
 from signals import vul_found
 from core.plugins.export_report import ExportPort
 from dongtai.models.project_report import ProjectReport
+import requests
+from hashlib import sha1
+
+LANGUAGE_MAP = {
+    "JAVA": 1,
+    "PYTHON": 2,
+    "PHP": 3,
+    "GO": 4
+}
 
 
 def queryset_to_iterator(queryset):
@@ -57,22 +66,30 @@ def queryset_to_iterator(queryset):
             break
 
 
-def load_sink_strategy(user=None):
+def load_sink_strategy(user=None, language=None):
     """
     加载用户user有权限方法的策略
     :param user:
     :return:
     """
-    # todo 增加语言筛选
     strategies = list()
-    strategy_models = HookStrategy.objects.filter(type__in=HookType.objects.filter(type=4),
-                                                  created_by__in=[user.id, 1] if user else [1])
+    language_id = 0
+    if language and language in LANGUAGE_MAP:
+        language_id = LANGUAGE_MAP[language]
+    strategy_models = HookStrategy.objects.filter(
+        type__in=HookType.objects.filter(type=4,
+                                         language_id=language_id) if language_id != 0 else HookType.objects.filter(
+            type=4),
+        created_by__in=[user.id, 1] if user else [1]
+    )
     sub_method_signatures = set()
     for sub_queryset in queryset_to_iterator(strategy_models):
         if sub_queryset is None:
             break
         for strategy in sub_queryset:
-            sub_method_signature = strategy.value.split('(')[0]
+            strategy_value = strategy.value
+            sub_method_signature = strategy_value[:strategy_value.rfind('(')] if strategy_value.rfind(
+                '(') > 0 else strategy_value
             if sub_method_signature in sub_method_signatures:
                 continue
 
@@ -85,66 +102,6 @@ def load_sink_strategy(user=None):
     return strategies
 
 
-def save_vul(vul_meta, vul_level, vul_name, vul_stack, top_stack, bottom_stack):
-    """
-    保存漏洞数据
-    :param vul_meta:
-    :param vul_level:
-    :param vul_name:
-    :param vul_stack:
-    :param top_stack:
-    :param bottom_stack:
-    :return:
-    """
-    vul = IastVulnerabilityModel.objects.filter(
-        type=vul_name,  # 指定漏洞类型
-        url=vul_meta.url,
-        http_method=vul_meta.http_method,
-        taint_position='',  # 或许补充相关数据
-        agent=vul_meta.agent
-    ).first()
-    if vul:
-        vul.req_header = vul_meta.req_header
-        vul.req_params = vul_meta.req_params
-        vul.counts = vul.counts + 1
-        vul.latest_time = int(time.time())
-        vul.status_id = settings.PENDING
-        vul.full_stack = json.dumps(vul_stack, ensure_ascii=False)
-        vul.method_pool_id = vul_meta.id
-        vul.save(update_fields=[
-            'req_header', 'req_params', 'counts', 'latest_time', 'full_stack', 'method_pool_id', 'status_id'
-        ])
-    else:
-        IastVulnerabilityModel.objects.create(
-            type=vul_name,
-            level=vul_level,
-            url=vul_meta.url,
-            uri=vul_meta.uri,
-            http_method=vul_meta.http_method,
-            http_scheme=vul_meta.http_scheme,
-            http_protocol=vul_meta.http_protocol,
-            req_header=vul_meta.req_header,
-            req_params=vul_meta.req_params,
-            req_data=vul_meta.req_data,
-            res_header=vul_meta.res_header,
-            res_body=vul_meta.res_body,
-            full_stack=json.dumps(vul_stack, ensure_ascii=False),
-            top_stack=top_stack,
-            bottom_stack=bottom_stack,
-            taint_value='',  # fixme: 污点数据，后续补充
-            taint_position='',  # fixme 增加污点位置
-            agent=vul_meta.agent,
-            context_path=vul_meta.context_path,
-            counts=1,
-            status_id=settings.PENDING,
-            first_time=vul_meta.create_time,
-            latest_time=int(time.time()),
-            client_ip=vul_meta.clent_ip,
-            param_name='',
-            method_pool_id=vul_meta.id
-        )
-
-
 def search_and_save_vul(engine, method_pool_model, method_pool, strategy):
     """
     搜索方法池是否存在满足策略的数据，如果存在，保存相关数据为漏洞
@@ -155,34 +112,27 @@ def search_and_save_vul(engine, method_pool_model, method_pool, strategy):
     """
     logger.info(f'current sink rule is {strategy.get("type")}')
 
-    queryset = IastStrategyModel.objects.filter(vul_type=strategy['type'])
+    queryset = IastStrategyModel.objects.filter(vul_type=strategy['type'], state=const.STRATEGY_ENABLE)
     if queryset.values('id').exists() is False:
+        logger.error(f'current method pool hit rule {strategy.get("type")}, but no vul strategy.')
         return
 
-    hook_type = HookType.objects.values('id').filter(value=strategy.get("type")).first()
-    if hook_type is None:
-        logger.error(f'current sink rule is {strategy.get("type")}, hook type is not exists.')
-        return
-
-    hook_type_id = hook_type['id']
-
-    vul_strategy = queryset.values("level", "vul_name").first()
     engine.search(method_pool=method_pool, vul_method_signature=strategy.get('value'))
     status, stack, source_sign, sink_sign, taint_value = engine.result()
 
     if status:
+        vul_strategy = queryset.values("level", "vul_name", "id").first()
         vul_found.send(
             sender="tasks.search_and_save_vul",
             vul_meta=method_pool_model,
             vul_level=vul_strategy['level'],
-            hook_type_id=hook_type_id,
+            strategy_id=vul_strategy['id'],
             vul_stack=stack,
             top_stack=source_sign,
             bottom_stack=sink_sign,
             taint_value=taint_value
         )
     else:
-        # 更新漏洞状态为已忽略/误报
         try:
             if isinstance(method_pool_model, MethodPool):
                 return
@@ -205,6 +155,7 @@ def search_and_save_vul(engine, method_pool_model, method_pool, strategy):
                 verify_time=timestamp,
                 update_time=timestamp
             )
+            IastProject.objects.filter(id=method_pool.agent.bind_project_id).update(latest_time=timestamp)
         except Exception as e:
             logger.info(f'漏洞数据处理出错，原因：{e}')
 
@@ -241,7 +192,7 @@ def search_vul_from_method_pool(method_pool_id):
         check_response_header(method_pool_model)
         check_response_content(method_pool_model)
 
-        strategies = load_sink_strategy(method_pool_model.agent.user)
+        strategies = load_sink_strategy(method_pool_model.agent.user, method_pool_model.agent.language)
         engine = VulEngine()
 
         method_pool = json.loads(method_pool_model.method_pool) if method_pool_model else []
@@ -262,7 +213,7 @@ def search_vul_from_replay_method_pool(method_pool_id):
         method_pool_model = IastAgentMethodPoolReplay.objects.filter(id=method_pool_id).first()
         if method_pool_model is None:
             logger.warn(f'重放数据漏洞检测终止，方法池 {method_pool_id} 不存在')
-        strategies = load_sink_strategy(method_pool_model.agent.user)
+        strategies = load_sink_strategy(method_pool_model.agent.user, method_pool_model.agent.language)
         engine = VulEngine()
 
         method_pool = json.loads(method_pool_model.method_pool)
@@ -315,7 +266,7 @@ def search_sink_from_method_pool(method_pool_id):
         if method_pool_model is None:
             logger.warn(f'sink规则扫描终止，方法池 [{method_pool_id}] 不存在')
             return
-        strategies = load_sink_strategy(method_pool_model.agent.user)
+        strategies = load_sink_strategy(method_pool_model.agent.user, method_pool_model.agent.language)
         engine = VulEngine()
 
         for strategy in strategies:
@@ -378,8 +329,154 @@ def load_methods_from_strategy(strategy_id):
     return strategy_value, method_pool_queryset
 
 
+def get_project_agents(agent):
+    agents = IastAgent.objects.filter(
+        bind_project_id=agent.bind_project_id,
+        project_version_id=agent.project_version_id,
+        user=agent.user
+    )
+    return agents
+
+def sca_scan_asset(asset):
+
+    """
+    根据SCA数据库，更新SCA记录信息
+    :return:
+    """
+    search_query = ""
+    agent = asset.agent
+    version = None
+    vul_count = 0
+    user_upload_package = None
+    if agent.language == "JAVA" and asset.signature_value:
+        # 用户上传的组件
+        user_upload_package = ScaMavenDb.objects.filter(sha_1=asset.signature_value).first()
+        search_query = "hash=" + asset.signature_value
+
+    elif agent.language == "PYTHON":
+        # @todo agent上报版本 or 捕获全量pip库
+        version = asset.version
+        name = asset.package_name.replace("-" + version, "")
+        search_query = "ecosystem={}&name={}&version={}".format("PyPI", name, version)
+
+    if search_query == "":
+        logger.info(f'search_query empty can not search vuls')
+    else:
+        package_name = asset.package_name
+
+        try:
+
+            url = settings.SCA_BASE_URL + "/package_vul/?" + search_query
+            logger.info(f'sca url: {url}')
+            resp = requests.get(url=url)
+            resp = json.loads(resp.content)
+            maven_model = resp.get("data", {}).get("package", {})
+            if maven_model is None:
+                maven_model = {}
+            vul_list = resp.get("data", {}).get("vul_list", {})
+
+            package_name = maven_model.get('aql', package_name)
+            version = maven_model.get('version', version)
+            if user_upload_package is not None:
+                package_name = user_upload_package.aql
+                version = user_upload_package.version
+
+            vul_count = len(vul_list)
+            levels = []
+            update_fields = list()
+
+            if asset.package_name != package_name:
+                asset.package_name = package_name
+                update_fields.append('package_name')
+
+            if asset.version != version:
+                asset.version = version
+                update_fields.append('version')
+
+            for vul in vul_list:
+                _level = vul.get("vul_package", {}).get("severity", "none")
+                if _level and _level not in levels:
+                    levels.append(_level)
+
+            if len(levels) > 0:
+
+                if 'critical' in levels:
+                    level = 'high'
+                elif 'high' in levels:
+                    level = 'high'
+                elif 'medium' in levels:
+                    level = 'medium'
+                elif 'low' in levels:
+                    level = 'low'
+                else:
+                    level = 'info'
+            else:
+                level = 'info'
+            new_level = IastVulLevel.objects.get(name=level)
+            if asset.level != new_level:
+                asset.level = IastVulLevel.objects.get(name=level)
+                update_fields.append('level')
+
+            if asset.vul_count != vul_count:
+                asset.vul_count = vul_count
+                update_fields.append('vul_count')
+
+            if len(update_fields) > 0:
+                logger.info(f'update dependency fields: {update_fields}')
+                asset.save(update_fields=update_fields)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            logger.info("get package_vul failed:{}".format(e))
+
+
+@shared_task(queue='dongtai-sca-task')
+def update_one_sca(agent_id, package_path, package_signature, package_name, package_algorithm):
+
+    """
+    根据SCA数据库，更新SCA记录信息
+    :return:
+    """
+    logger.info(f'SCA检测开始 [{agent_id} {package_path} {package_signature} {package_name} {package_algorithm}]')
+    agent = IastAgent.objects.filter(id=agent_id).first()
+    version = None
+    if agent.language == "JAVA":
+        version = package_name.split('/')[-1].replace('.jar', '').split('-')[-1]
+    elif agent.language == "PYTHON":
+        # @todo agent上报版本 or 捕获全量pip库
+        version = package_name.split('/')[-1].split('-')[-1]
+
+    current_version_agents = get_project_agents(agent)
+    if package_signature:
+        asset_count = Asset.objects.values("id").filter(signature_value=package_signature,
+                                                        agent__in=current_version_agents).count()
+    else:
+        package_signature = sha_1('-'.join([package_name, version]))
+        asset_count = Asset.objects.values("id").filter(package_name=package_name,
+                                                        version=version,
+                                                        agent__in=current_version_agents).count()
+
+    if asset_count == 0:
+        new_level = IastVulLevel.objects.get(name="info")
+        asset = Asset.objects.create(
+            package_name=package_name,
+            package_path=package_path,
+            signature_algorithm=package_algorithm,
+            signature_value=package_signature,
+            dt=time.time(),
+            version=version,
+            level=new_level,
+            vul_count=0,
+            agent=agent
+        )
+        sca_scan_asset(asset)
+    else:
+        logger.info(
+            f'SCA检测开始 [{agent_id} {package_path} {package_signature} {package_name} {package_algorithm}] 组件已存在')
+
 @shared_task(queue='dongtai-periodic-task')
-def update_sca():
+def update_all_sca():
     """
     根据SCA数据库，更新SCA记录信息
     :return:
@@ -399,49 +496,16 @@ def update_sca():
                 break
 
             for asset in asset_steps:
-                update_fields = list()
-                signature = asset.signature_value
-                maven_model = ScaMavenDb.objects.filter(sha_1=signature).values('aql').first()
-                if maven_model is not None and asset.package_name != maven_model['aql']:
-                    logger.info('update dependency name')
-                    asset.package_name = maven_model['aql']
-                    update_fields.append('package_name')
-
-                aids = ScaMavenArtifact.objects.filter(signature=signature).values("aid")
-                vul_count = len(aids)
-                levels = ScaVulDb.objects.filter(id__in=aids).values('vul_level')
-
-                level = 'info'
-                if len(levels) > 0:
-                    levels = [_['vul_level'] for _ in levels]
-                    if 'high' in levels:
-                        level = 'high'
-                    elif 'high' in levels:
-                        level = 'high'
-                    elif 'medium' in levels:
-                        level = 'medium'
-                    elif 'low' in levels:
-                        level = 'low'
-                    else:
-                        level = 'info'
-
-                new_level = IastVulLevel.objects.get(name=level)
-                if asset.level != new_level:
-                    asset.level = IastVulLevel.objects.get(name=level)
-                    update_fields.append('level')
-
-                if asset.vul_count != vul_count:
-                    asset.vul_count = vul_count
-                    update_fields.append('vul_count')
-
-                if len(update_fields) > 0:
-                    logger.info(f'update dependency fields: {update_fields}')
-                    asset.save(update_fields=update_fields)
+                sca_scan_asset(asset)
             start = start + 1
         logger.info('SCA离线检测完成')
     except Exception as e:
         logger.error(f'SCA离线检测出错，错误原因：{e}')
 
+def sha_1(raw):
+    h = sha1()
+    h.update(raw.encode('utf-8'))
+    return h.hexdigest()
 
 def is_alive(agent_id, timestamp):
     """
@@ -506,7 +570,6 @@ def heartbeat():
     }
     try:
         logger.info('[core.tasks.heartbeat] send heartbeat data to OpenApi Service.')
-        import requests
         resp = requests.post(url='http://openapi.iast.huoxian.cn:8000/api/v1/engine/heartbeat', json=heartbeat_raw)
         if resp.status_code == 200:
             logger.info('[core.tasks.heartbeat] send heartbeat data to OpenApi Service Successful.')
@@ -531,6 +594,7 @@ def clear_error_log():
     except Exception as e:
         logger.error(f'日志清理失败，错误详情：{e}')
 
+
 @shared_task(queue='dongtai-periodic-task')
 def export_report():
     """
@@ -540,8 +604,8 @@ def export_report():
     logger.info(f'导出报告')
     report = ProjectReport.objects.filter(status=0).first()
     if not report:
-        logger.error("暂无需要导出的报告")
-        return 
+        logger.info("暂无需要导出的报告")
+        return
     try:
         report.status = 1
         report.save()
@@ -551,6 +615,7 @@ def export_report():
         report.status = 0
         report.save()
         logger.error(f'导出报告，错误详情：{e}')
+
 
 @shared_task(queue='dongtai-replay-task')
 def vul_recheck():
@@ -583,12 +648,13 @@ def vul_recheck():
             continue
 
         param_name_value = vulnerability['param_name']
-        try:
-            params = json.loads(param_name_value)
-        except JSONDecodeError as e:
-            logger.error(f'污点数据解析出错，原因：{e}')
-            Replay.replay_failed(replay=replay, timestamp=timestamp)
-            continue
+        if param_name_value is not None:
+            try:
+                params = json.loads(param_name_value)
+            except JSONDecodeError as e:
+                logger.error(f'污点数据解析出错，原因：{e}')
+                Replay.replay_failed(replay=replay, timestamp=timestamp)
+                continue
 
         uri = vulnerability['uri']
         param_value = vulnerability['req_params'] if vulnerability['req_params'] else ''

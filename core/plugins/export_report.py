@@ -23,6 +23,7 @@ from docx.shared import Pt
 from lingzhi_engine.settings import MEDIA_ROOT
 from django.utils.translation import gettext as _
 from django.utils.translation import activate
+from dongtai.models.strategy import IastStrategyModel
 
 import os
 
@@ -46,19 +47,39 @@ def delete_old_files(path, save_seconds=3600):
 
 
 def get_vul_count_by_agent(agent_ids, vid, user):
-    typeInfo = IastVulnerabilityModel.objects.filter(
-        agent_id__in=agent_ids).values().order_by("level")
+    queryset = IastVulnerabilityModel.objects.filter(
+        agent_id__in=agent_ids)
+    typeInfo = queryset.values().order_by("level")
     if vid:
         typeInfo = typeInfo.filter(id=vid)
     type_summary = []
     levelCount = {}
     vulDetail = {}
+    strategy_ids = queryset.values_list('strategy_id',
+                                        flat=True).distinct()
+    strategys = {
+        strategy['id']: strategy
+        for strategy in IastStrategyModel.objects.filter(
+            pk__in=strategy_ids).values('id', 'vul_name').all()
+    }
+    hook_type_ids = queryset.values_list('hook_type_id',
+                                         flat=True).distinct()
+    hooktypes = {
+        hooktype['id']: hooktype
+        for hooktype in HookType.objects.filter(
+            pk__in=hook_type_ids).values('id', 'name').all()
+    }
     if typeInfo:
         typeArr = {}
         typeLevel = {}
         for one in typeInfo:
-            hook_type = HookType.objects.filter(pk=one['hook_type_id']).first()
-            one['type'] = hook_type.name if hook_type else ''
+            hook_type = hooktypes.get(one['hook_type_id'], None)
+            hook_type_name = hook_type['name'] if hook_type else None
+            strategy = strategys.get(one['strategy_id'], None)
+            strategy_name = strategy['vul_name'] if strategy else None
+            type_ = list(
+                filter(lambda x: x is not None, [strategy_name, hook_type_name]))
+            one['type'] = type_[0] if type_ else ''
             typeArr[one['type']] = typeArr.get(one['type'], 0) + 1
             typeLevel[one['type']] = one['level_id']
             levelCount[one['level_id']] = levelCount.get(one['level_id'], 0) + 1
@@ -76,32 +97,47 @@ def get_vul_count_by_agent(agent_ids, vid, user):
             except Exception as e:
                 one['req_params'] = ""
             detailStr2 = str(one['http_method']) + " " + str(one['uri']) + "?" + str(one['req_params']) + str(one['http_protocol'])
-            try:
-                fileData = one['full_stack'][-1].get("stack", "")
-                pattern = r'.*?\((.*?)\).*?'
-                resMatch = re.match(pattern, fileData)
-                uriArr = resMatch.group(1).split(":")
-                fileName = uriArr[0]
-                if len(uriArr) > 1:
-                    rowStr = _("{} Line").format(str(uriArr[1]))
-                else:
-                    rowStr = ""
-            except Exception as e:
-                fileName = ""
-                rowStr = ""
-            classname = ""
-            methodname = ""
+
+            param = one['param_name']
+            taintStrStack = []
+            sourceStr = ""
+            sinkStr = ""
+            detailStr3 = ""
             if one['full_stack']:
-                try:
+                # try:
                     full_stack_arr = json.loads(one['full_stack'])
-                    full_stack = full_stack_arr[-1]
-                    classname = str(full_stack.get("classname", ""))
-                    methodname = str(full_stack.get("methodname", ""))
-                except Exception as e:
-                    print("======")
-            detailStr3 = _("In {} {} call {}. {} (), Incoming parameters {}").format(
-                str(fileName), rowStr, classname, methodname,
-                str(one['taint_value']))
+                    if len(full_stack_arr) > 0 and isinstance(full_stack_arr[0], list):
+                        for stack in full_stack_arr[0]:
+                            caller = f"{stack['callerClass']}.{stack['callerMethod']}()"
+                            class_name = stack['originClassName'] if 'originClassName' in stack else stack['className']
+                            method_name = stack['methodName']
+                            node = f'{class_name}.{method_name}()'
+                            if stack['tag'] == 'source':
+                                sourceStr = _("call {3} at line {2} of file {1}, incoming parameters {0}").format(
+                                    param,
+                                    stack['callerClass'],
+                                    stack['callerLineNumber'],
+                                    node
+                                )
+                            if stack['tag'] == 'propagator':
+                                taintStrStack.append(
+                                    _("call function {2} at line {1} of {0}").format(
+                                        stack['callerClass'],
+                                        stack['callerLineNumber'],
+                                        node
+                                    )
+                                )
+                            if stack['tag'] == 'sink':
+                                sinkStr = _("run sink function {2} at line {1} of file {0}").format(
+                                    stack['callerClass'],
+                                    stack['callerLineNumber'],
+                                    node
+                                )
+                        taintStr = "\n; ".join(taintStrStack)
+                        detailStr3 = _("Code call chain: \n{0}, and then {1},\n {2}").format(sourceStr, taintStr, sinkStr)
+                    else:
+                        detailStr3 = _("Code call chain: call {1} at {0}").format(one['top_stack'], one['bottom_stack'])
+
             cur_tile = _("{} Appears in {} {}").format(one['type'], str(one['uri']), str(one['taint_position']))
             if one['param_name']:
                 cur_tile = cur_tile + "\"" + str(one['param_name']) + "\""
@@ -170,7 +206,6 @@ class ExportPort():
         project = IastProject.objects.filter(Q(id=pid)).first()
 
         vul = IastVulnerabilityModel.objects.filter(pk=vid).first()
-
         if project or vul:
             if not project:
                 Project = namedtuple(
@@ -191,7 +226,6 @@ class ExportPort():
             count_result = get_vul_count_by_agent(agent_ids, vid, user)
 
             levelInfo = IastVulLevel.objects.all()
-
             file_path = ""
             if type == 'docx':
                 file_path = self.generate_word_report(user, project, vul, count_result, levelInfo, timestamp)
@@ -250,7 +284,8 @@ class ExportPort():
         table = document.add_table(rows=1, cols=2, style='Table Grid')
 
         hdr_cells = table.rows[0].cells
-
+        project_vul_count = sum([i['type_count'] for i in count_result['type_summary']])
+        project_agent_count = len(self.get_agents_with_project_id(project.id))
         new_cells = table.add_row().cells
         new_cells[0].text = _('Application name')
         new_cells[1].text = project.name
@@ -262,10 +297,10 @@ class ExportPort():
         new_cells[1].text = project.mode
         new_cells = table.add_row().cells
         new_cells[0].text = _('Number of Vulnerability')
-        new_cells[1].text = str(project.vul_count)
+        new_cells[1].text = str(project_vul_count)
         new_cells = table.add_row().cells
         new_cells[0].text = _('Number of Agent')
-        new_cells[1].text = str(project.agent_count)
+        new_cells[1].text = str(project_agent_count)
         new_cells = table.add_row().cells
         new_cells[0].text = _('Latest time')
         new_cells[1].text = time.strftime("%Y-%m-%d %H:%M:%S", timeArray)
@@ -436,20 +471,25 @@ class ExportPort():
 
                             "description": _(u'Vulnerability description'),
                             "detail": "",
+                            "detail_data1": "",
+                            "detail_data2": "",
+                            "detail_data3": "",
                         }
                         vulTypeDetail['vuls'].append(
                             oneVul
                         )
                         ind = ind + 1
                         if one['detail_data']:
-                            for item in one['detail_data']:
-                                oneVul['detail'] += u'%s' % item
+                            oneVul['detail_data1'] = one['detail_data'][0]
+                            oneVul['detail_data2'] = one['detail_data'][1]
+                            oneVul['detail_data3'] = one['detail_data'][2]
+                            # for item in one['detail_data']:
+                            #     oneVul['detail'] += u'%s' % item
                 vulTypeDetailArray.append(vulTypeDetail)
                 type_ind = type_ind + 1
 
         pdf_filename = f"{MEDIA_ROOT}/reports/vul-report-{user.id}-{timestamp}.pdf"
         html_filename = f"{MEDIA_ROOT}/reports/vul-report-{user.id}-{timestamp}.html"
-
         rendered = render_to_string(
             './pdf.html',
             {
